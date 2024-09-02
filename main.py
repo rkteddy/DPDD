@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torchvision.utils import save_image
+from opacus.accountants.utils import get_noise_multiplier
+from epsilon_calculation import sub_epsilon
 from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch, DiffAugment, ParamDiffAug
 
 
@@ -19,8 +21,8 @@ def main():
     parser.add_argument('--eval_mode', type=str, default='S', help='eval_mode') # S: the same to training model, M: multi architectures,  W: net width, D: net depth, A: activation function, P: pooling layer, N: normalization layer,
     parser.add_argument('--num_exp', type=int, default=5, help='the number of experiments')
     parser.add_argument('--num_eval', type=int, default=20, help='the number of evaluating randomly initialized models')
-    parser.add_argument('--epoch_eval_train', type=int, default=300, help='epochs to train a model with synthetic data')
-    parser.add_argument('--Iteration', type=int, default=1000, help='training iterations')
+    parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
+    parser.add_argument('--iteration', type=int, default=1000, help='training iterations')
     parser.add_argument('--lr_img', type=float, default=0.1, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
@@ -29,7 +31,16 @@ def main():
     parser.add_argument('--dsa_strategy', type=str, default='None', help='differentiable Siamese augmentation strategy')
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
-    parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
+    parser.add_argument('--dis_metric', type=str, default='mse', help='distance metric')
+    
+    parser.add_argument('--dp-a', action='store_true', help='whether to add noise to the first stage')
+    parser.add_argument('--dp-b', action='store_true', help='whether to add noise to the second stage')
+    parser.add_argument('--dp-c', action='store_true', help='whether to add noise to the third stage')
+    parser.add_argument('--max-grad-norm-a', type=float, default=1.0, help='parameter for differential privacy')
+    parser.add_argument('--max-grad-norm-b', type=float, default=1.0, help='parameter for differential privacy')
+    parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
+    parser.add_argument('--delta', type=float, default=1e-5, help='parameter for differential privacy')
+
 
     args = parser.parse_args()
     args.outer_loop, args.inner_loop = get_loops(args.ipc)
@@ -43,7 +54,8 @@ def main():
     if not os.path.exists(args.save_path):
         os.mkdir(args.save_path)
 
-    eval_it_pool = np.arange(0, args.Iteration+1, 500).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.Iteration] # The list of iterations when we evaluate models and record results.
+    eval_it_pool = np.arange(0, args.iteration+1, 500).tolist() if args.eval_mode == 'S' or args.eval_mode == 'SS' else [args.iteration] # The list of iterations when we evaluate models and record results.
+    eval_it_pool = [20, 50, 100, 200, 500, 1000]
     print('eval_it_pool: ', eval_it_pool)
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(args.dataset, args.data_path)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
@@ -79,6 +91,10 @@ def main():
         def get_images(c, n): # get random n images from class c
             idx_shuffle = np.random.permutation(indices_class[c])[:n]
             return images_all[idx_shuffle]
+        
+        def get_random_images(n): # get random n images
+            idx_shuffle = np.random.permutation(len(images_all))[:n]
+            return images_all[idx_shuffle], labels_all[idx_shuffle]
 
         for ch in range(channel):
             print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
@@ -94,7 +110,31 @@ def main():
                 image_syn.data[c*args.ipc:(c+1)*args.ipc] = get_images(c, args.ipc).detach().data
         else:
             print('initialize synthetic data from random noise')
+        
+        
+        
+        # sample_rate_a = args.batch_real * num_classes / len(dst_train)
+        # dp_steps_a = int(len(dst_train) / (args.batch_real * num_classes) * args.iteration * args.outer_loop)
+        sample_rate_a = args.batch_real / len(dst_train)
+        dp_steps_a = args.iteration * args.outer_loop
+        sample_rate_b = args.batch_real / len(dst_train)
+        dp_steps_b = args.iteration * args.outer_loop
 
+        print('DP steps A: ', dp_steps_a)
+        print('DP steps B: ', dp_steps_b)
+
+        args.sigma_a = get_noise_multiplier(target_epsilon=args.epsilon, target_delta=args.delta,
+                            sample_rate=sample_rate_a,
+                            steps=dp_steps_a)
+        print('Noise sigma A: ', args.sigma_a)
+        args.sigma_b = get_noise_multiplier(target_epsilon=args.epsilon, target_delta=args.delta,
+                            sample_rate=sample_rate_b,
+                            steps=dp_steps_b)
+        print(sample_rate_a, dp_steps_a)
+        print(sample_rate_b, dp_steps_b)
+        # args.sigma_b = args.sigma_a
+            
+        print('Noise sigma B: ', args.sigma_b)
 
         ''' training '''
         optimizer_img = torch.optim.SGD([image_syn, ], lr=args.lr_img, momentum=0.5) # optimizer_img for synthetic data
@@ -102,9 +142,9 @@ def main():
         criterion = nn.CrossEntropyLoss().to(args.device)
         print('%s training begins'%get_time())
 
-        for it in range(args.Iteration+1):
+        for it in range(args.iteration+1):
 
-            ''' Evaluate synthetic data '''
+            # ''' Evaluate synthetic data '''
             if it in eval_it_pool:
                 for model_eval in model_eval_pool:
                     print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(args.model, model_eval, it))
@@ -130,7 +170,7 @@ def main():
                         accs.append(acc_test)
                     print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
 
-                    if it == args.Iteration: # record the final results
+                    if it == args.iteration: # record the final results
                         accs_all_exps[model_eval] += accs
 
                 ''' visualize and save '''
@@ -175,10 +215,14 @@ def main():
 
 
                 ''' update synthetic data '''
+                losses = []
                 loss = torch.tensor(0.0).to(args.device)
+                total_img_real, total_lab_real = get_random_images(args.batch_real*10)
                 for c in range(num_classes):
-                    img_real = get_images(c, args.batch_real)
+                    # img_real = get_images(c, args.batch_real)
+                    img_real = total_img_real[total_lab_real==c]
                     lab_real = torch.ones((img_real.shape[0],), device=args.device, dtype=torch.long) * c
+                    # img_real, lab_real = get_random_images(args.batch_real)
                     img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
                     lab_syn = torch.ones((args.ipc,), device=args.device, dtype=torch.long) * c
 
@@ -187,25 +231,85 @@ def main():
                         img_real = DiffAugment(img_real, args.dsa_strategy, seed=seed, param=args.dsa_param)
                         img_syn = DiffAugment(img_syn, args.dsa_strategy, seed=seed, param=args.dsa_param)
 
-                    output_real = net(img_real)
-                    loss_real = criterion(output_real, lab_real)
-                    gw_real = torch.autograd.grad(loss_real, net_parameters)
-                    gw_real = list((_.detach().clone() for _ in gw_real))
+                    if args.dp_a or args.dp_b:
+                        grads = []
+                        for sample_img, sample_lab in zip(img_real, lab_real):
+                            sample_out = net(sample_img.unsqueeze(0))
+                            sample_loss = criterion(sample_out, sample_lab.unsqueeze(0))
+                            sample_grad = torch.autograd.grad(sample_loss, net.parameters())
+                            sample_grad_flat = torch.cat([gr.data.view(-1) for gr in sample_grad])
+                            grads.append(sample_grad_flat.detach().clone())
+                        
+                        if args.dp_a:
+                            gw_real = [torch.zeros_like(param) for param in net.parameters()]
+                            st, ed = 0, 0
+                            for i, param in enumerate(net.parameters()):
+                                ed = st + torch.numel(param)
+                                for grad in grads:
+                                    clip_coef = min(1, args.max_grad_norm_a / (grad.data.norm(2) + 1e-7))
+                                    grad.mul_(clip_coef)
+                                    gw_real[i] += grad[st:ed].reshape(param.shape)
+                                noise = torch.randn_like(param) * args.sigma_a * args.max_grad_norm_a
+                                gw_real[i] = (gw_real[i] + noise) / args.batch_real
+                                st = ed
+                            
+                        else:
+                            batch_gw_real = []
+                            for grad in grads:
+                                sample_gw_real = []
+                                st, ed = 0, 0
+                                for param in net.parameters():
+                                    ed = st + torch.numel(param)
+                                    sample_gw_real.append(grad[st: ed].reshape(param.shape).detach())
+                                    st = ed
+                                batch_gw_real.append(sample_gw_real)
+
+                    else:
+                        output_real = net(img_real)
+                        loss_real = criterion(output_real, lab_real)
+                        gw_real = torch.autograd.grad(loss_real, net_parameters)
+                        gw_real = list((_.detach().clone() for _ in gw_real))
 
                     output_syn = net(img_syn)
                     loss_syn = criterion(output_syn, lab_syn)
                     gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True)
 
-                    loss += match_loss(gw_syn, gw_real, args)
+                    if args.dp_b:
+                        for sample_gw_real in batch_gw_real:
+                            losses.append(match_loss(gw_syn, sample_gw_real, args))
+                    else:
+                        loss += match_loss(gw_syn, gw_real, args)
+                            
+                if args.dp_b:
+                    sum_gradient = 0
+                    batch_size = args.batch_real * num_classes
+                    for i in range(batch_size):
+                        optimizer_img.zero_grad()
+                        # Backward pass for each sample
+                        losses[i].backward(retain_graph=True if i < batch_size - 1 else False)
+                        # Storing gradients
+                        gradient = image_syn.grad.clone()
 
-                optimizer_img.zero_grad()
-                loss.backward()
-                optimizer_img.step()
-                loss_avg += loss.item()
+                        clip_coef = min(1, args.max_grad_norm_b / (gradient.data.norm(2) + 1e-7))
+                        gradient.mul_(clip_coef)
+                        
+                        sum_gradient += gradient
+                    
+
+                    noise = torch.randn_like(gradient) * args.sigma_b * args.max_grad_norm_b
+                    image_syn.grad.zero_()
+
+                    image_syn.grad.add_((sum_gradient + noise*num_classes)/batch_size)
+                    optimizer_img.step()
+                    loss_avg += torch.Tensor(losses).sum().item()
+                else:
+                    optimizer_img.zero_grad()
+                    loss.backward()
+                    optimizer_img.step()
+                    loss_avg += loss.item()
 
                 if ol == args.outer_loop - 1:
                     break
-
 
                 ''' update network '''
                 image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
@@ -220,7 +324,7 @@ def main():
             if it%10 == 0:
                 print('%s iter = %04d, loss = %.4f' % (get_time(), it, loss_avg))
 
-            if it == args.Iteration: # only record the final results
+            if it == args.iteration: # only record the final results
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
                 torch.save({'data': data_save, 'accs_all_exps': accs_all_exps, }, os.path.join(args.save_path, 'res_%s_%s_%s_%dipc.pt'%(args.method, args.dataset, args.model, args.ipc)))
 
