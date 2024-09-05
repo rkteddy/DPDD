@@ -35,7 +35,6 @@ def main():
     
     parser.add_argument('--dp-a', action='store_true', help='whether to add noise to the first stage')
     parser.add_argument('--dp-b', action='store_true', help='whether to add noise to the second stage')
-    parser.add_argument('--dp-c', action='store_true', help='whether to add noise to the third stage')
     parser.add_argument('--max-grad-norm-a', type=float, default=1.0, help='parameter for differential privacy')
     parser.add_argument('--max-grad-norm-b', type=float, default=1.0, help='parameter for differential privacy')
     parser.add_argument('--epsilon', type=float, default=10., help='parameter for differential privacy')
@@ -115,9 +114,9 @@ def main():
         
         # sample_rate_a = args.batch_real * num_classes / len(dst_train)
         # dp_steps_a = int(len(dst_train) / (args.batch_real * num_classes) * args.iteration * args.outer_loop)
-        sample_rate_a = args.batch_real / len(dst_train)
+        sample_rate_a = args.batch_real * num_classes / len(dst_train)
         dp_steps_a = args.iteration * args.outer_loop
-        sample_rate_b = args.batch_real / len(dst_train)
+        sample_rate_b = args.batch_real * num_classes / len(dst_train)
         dp_steps_b = args.iteration * args.outer_loop
 
         print('DP steps A: ', dp_steps_a)
@@ -217,12 +216,13 @@ def main():
                 ''' update synthetic data '''
                 losses = []
                 loss = torch.tensor(0.0).to(args.device)
-                total_img_real, total_lab_real = get_random_images(args.batch_real*10)
+                total_img_real, total_lab_real = get_random_images(args.batch_real*num_classes)
                 for c in range(num_classes):
-                    # img_real = get_images(c, args.batch_real)
-                    img_real = total_img_real[total_lab_real==c]
+                    if args.dp_b:
+                        img_real = total_img_real[total_lab_real==c]
+                    else:
+                        img_real = get_images(c, args.batch_real)
                     lab_real = torch.ones((img_real.shape[0],), device=args.device, dtype=torch.long) * c
-                    # img_real, lab_real = get_random_images(args.batch_real)
                     img_syn = image_syn[c*args.ipc:(c+1)*args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
                     lab_syn = torch.ones((args.ipc,), device=args.device, dtype=torch.long) * c
 
@@ -250,9 +250,8 @@ def main():
                                     grad.mul_(clip_coef)
                                     gw_real[i] += grad[st:ed].reshape(param.shape)
                                 noise = torch.randn_like(param) * args.sigma_a * args.max_grad_norm_a
-                                gw_real[i] = (gw_real[i] + noise) / args.batch_real
+                                gw_real[i] = ((gw_real[i] + noise) / args.batch_real).detach()
                                 st = ed
-                            
                         else:
                             batch_gw_real = []
                             for grad in grads:
@@ -299,7 +298,7 @@ def main():
                     noise = torch.randn_like(gradient) * args.sigma_b * args.max_grad_norm_b
                     image_syn.grad.zero_()
 
-                    image_syn.grad.add_((sum_gradient + noise*num_classes)/batch_size)
+                    image_syn.grad.add_((sum_gradient + noise)/batch_size)
                     optimizer_img.step()
                     loss_avg += torch.Tensor(losses).sum().item()
                 else:
@@ -338,5 +337,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
